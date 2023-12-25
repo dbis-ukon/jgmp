@@ -1,0 +1,921 @@
+diff --git a/src/backend/optimizer/path/costsize.c b/src/backend/optimizer/path/costsize.c
+index 006f91f..18e02b6 100644
+--- a/src/backend/optimizer/path/costsize.c
++++ b/src/backend/optimizer/path/costsize.c
+@@ -98,9 +98,33 @@
+ #include "utils/spccache.h"
+ #include "utils/tuplesort.h"
+ 
++// END2END >>>>>
++#include "nodes/print.h"
++#include "catalog/pg_type.h"
++#include <unistd.h>
++#include <time.h>
++#include <stdlib.h>
++typedef char TYPCATEGORY;
++// <<<<< END2END
+ 
+ #define LOG2(x)  (log(x) / 0.693147180559945)
+ 
++// END2END >>>>>
++#define CARD_EST_QUERY_NUM 20000
++static double card_ests[CARD_EST_QUERY_NUM] = {0.0};
++static double join_card_ests[CARD_EST_QUERY_NUM] = {0.0};
++int         query_no = 0;
++int         join_est_no = 0;
++bool        ml_cardest_enabled = false;
++bool        ml_joinest_enabled = false;
++bool        debug_card_est = false;
++bool        print_sub_queries = false;
++bool        print_single_tbl_queries = false;
++char        *ml_cardest_fname = NULL;
++char        *ml_joinest_fname = NULL;
++// <<<<< END2END
++
++
+ /*
+  * Append and MergeAppend nodes are less expensive than some other operations
+  * which use cpu_tuple_cost; instead of adding a separate GUC, estimate the
+@@ -190,6 +214,553 @@ static double relation_byte_size(double tuples, int width);
+ static double page_size(double tuples, int width);
+ static double get_parallel_divisor(Path *path);
+ 
++// END2END >>>>>
++static void print_est_card(const char* func_name, double card);
++static void print_query_no(const char* func_name);
++static void read_from_fspn_estimate(const char* filename);
++static void read_from_fspn_join_estimate(const char* filename);
++static void fprint_expr(FILE* fp, const Node *expr, const List *rtable);
++
++static void
++print_relids(FILE* fp, PlannerInfo *root, Relids relids)
++{
++    int			x;
++    bool		first = true;
++
++    x = -1;
++    while ((x = bms_next_member(relids, x)) >= 0)
++    {
++        if (!first)
++            fprintf(fp, ", ");
++        if (x < root->simple_rel_array_size &&
++            root->simple_rte_array[x])
++            fprintf(fp, "\"%s\"", root->simple_rte_array[x]->eref->aliasname);
++        else
++            fprintf(fp, "%d", x);
++        first = false;
++    }
++}
++
++static void
++print_restrictclauses(FILE* fp, PlannerInfo *root, List *clauses)
++{
++    ListCell   *l;
++
++    foreach(l, clauses)
++    {
++        RestrictInfo *c = lfirst(l);
++        fprintf(fp, "\"");
++        fprint_expr(fp, (Node *) c->clause, root->parse->rtable);
++        fprintf(fp, "\"");
++        if (lnext(clauses, l))
++            fprintf(fp, ", ");
++    }
++}
++
++char** splitArrayString(const char* str, int* size) {
++    *size = 0; // this will store the number of elements found
++
++    // Count the number of commas to estimate the number of substrings
++    for(int i = 0; str[i]; i++) {
++        if(str[i] == ',') (*size)++;
++    }
++    (*size)++; // account for the last element
++
++    // Allocate memory for the array of strings
++    char** result = (char**)malloc((*size) * sizeof(char*));
++
++    int start = 1; // Start after the opening brace
++    int index = 0;
++
++    for(int i = 1; str[i]; i++) {
++        if(str[i] == ',' || str[i] == '}') {
++            int length = i - start;
++
++            // Allocate memory for each substring
++            result[index] = (char*) malloc((length + 1) * sizeof(char));
++            if(!result[index]) {
++                perror("Memory allocation error");
++                exit(1);
++            }
++
++            strncpy(result[index], str + start, length);
++            result[index][length] = '\0'; // Null terminate the substring
++
++            start = i + 1; // Adjust start position for the next substring
++            index++;
++        }
++    }
++
++    return result;
++}
++
++static void
++fprint_const(FILE* fp, const Oid const_type, const TYPCATEGORY type_category, const char *str)
++{
++    if (type_category == TYPCATEGORY_ARRAY) {
++        Oid element_type_oid;
++        TYPCATEGORY element_type_category;
++        bool element_type_is_preferred;
++        int size;
++
++        element_type_oid = get_element_type(const_type);
++        get_type_category_preferred(element_type_oid, &element_type_category, &element_type_is_preferred);
++
++        char **element_strings = splitArrayString(str, &size);
++        fprintf(fp, "(");
++        for (int i = 0; i < size; i++)
++        {
++            if (i > 0)
++            {
++                fprintf(fp, ", ");
++            }
++            fprint_const(fp, element_type_oid, element_type_category, element_strings[i]);
++            free(element_strings[i]);
++        }
++        fprintf(fp, ")");
++        free(element_strings);
++    }
++    else if (type_category == TYPCATEGORY_STRING)
++    {
++        // TODO: Triple escape string contents: once for C, once for JSON, once for SQL
++        ulong str_len = strlen(str);
++        if (str[0] == '"' && str[str_len - 1] == '"')
++        {
++            fprintf(fp,"'");
++            for (int i = 1; i < str_len - 1; i++)
++            {
++                fprintf(fp, "%c", str[i]);
++            }
++            fprintf(fp,"'");
++        }
++        else
++        {
++            fprintf(fp,"'%s'", str);
++        }
++
++    }
++    else if (type_category == TYPCATEGORY_DATETIME)
++    {
++        fprintf(fp,"'%s'", str);
++    }
++    else if (type_category == TYPCATEGORY_BOOLEAN || type_category == TYPCATEGORY_NUMERIC)
++    {
++        fprintf(fp,"%s", str);
++    }
++    else if (type_category == TYPCATEGORY_TIMESPAN)
++    {
++        fprintf(fp,"interval '%s'", str);
++    }
++    else
++    {
++        fprintf(fp,"unknown type category %c: %s", type_category, str);
++    }
++}
++
++static void
++fprint_expr(FILE* fp, const Node *expr, const List *rtable)
++{
++    if (expr == NULL)
++    {
++        fprintf(fp,"<>");
++        return;
++    }
++
++    if (IsA(expr, Var))
++    {
++        const Var  *var = (const Var *) expr;
++        char	   *relname,
++                *attname;
++
++        switch (var->varno)
++        {
++            case INNER_VAR:
++                relname = "INNER";
++                attname = "?";
++                break;
++            case OUTER_VAR:
++                relname = "OUTER";
++                attname = "?";
++                break;
++            case INDEX_VAR:
++                relname = "INDEX";
++                attname = "?";
++                break;
++            default:
++            {
++                RangeTblEntry *rte;
++
++                Assert(var->varno > 0 &&
++                       (int) var->varno <= list_length(rtable));
++                rte = rt_fetch(var->varno, rtable);
++                relname = rte->eref->aliasname;
++                attname = get_rte_attribute_name(rte, var->varattno);
++            }
++                break;
++        }
++        fprintf(fp,"%s.%s", relname, attname);
++    }
++    else if (IsA(expr, Const))
++    {
++        const Const *c = (const Const *) expr;
++        Oid			typoutput;
++        bool		typIsVarlena;
++        char	   *outputstr;
++        TYPCATEGORY type_category;
++        bool		type_is_preferred;
++
++        if (c->constisnull)
++        {
++            fprintf(fp,"NULL");
++            return;
++        }
++
++        getTypeOutputInfo(c->consttype,
++                          &typoutput, &typIsVarlena);
++
++        outputstr = OidOutputFunctionCall(typoutput, c->constvalue);
++
++        get_type_category_preferred(c->consttype, &type_category, &type_is_preferred);
++        fprint_const(fp, c->consttype, type_category, outputstr);
++
++        pfree(outputstr);
++    }
++    else if (IsA(expr, OpExpr))
++    {
++        const OpExpr *e = (const OpExpr *) expr;
++        char	   *opname;
++
++        opname = get_opname(e->opno);
++        if (list_length(e->args) > 1)
++        {
++            fprint_expr(fp, get_leftop((const Expr *) e), rtable);
++            fprintf(fp," %s ", ((opname != NULL) ? opname : "(invalid operator)"));
++            fprint_expr(fp, get_rightop((const Expr *) e), rtable);
++        }
++        else
++        {
++            /* we print prefix and postfix ops the same... */
++            fprintf(fp,"%s ", ((opname != NULL) ? opname : "(invalid operator)"));
++            fprint_expr(fp, get_leftop((const Expr *) e), rtable);
++        }
++    }
++    else if (IsA(expr, FuncExpr))
++    {
++        const FuncExpr *e = (const FuncExpr *) expr;
++        char	   *funcname;
++        ListCell   *l;
++
++        funcname = get_func_name(e->funcid);
++        if (strcmp(funcname, "numeric") == 0)
++        {
++            foreach(l, e->args)
++            {
++                fprint_expr(fp, lfirst(l), rtable);
++                if (lnext(e->args, l))
++                    fprintf(fp,",");
++            }
++            fprintf(fp,"::numeric");
++        } else
++        {
++            fprintf(fp,"%s(", ((funcname != NULL) ? funcname : "(invalid function)"));
++            foreach(l, e->args)
++            {
++                fprint_expr(fp, lfirst(l), rtable);
++                if (lnext(e->args, l))
++                    fprintf(fp,",");
++            }
++            fprintf(fp,")");
++        }
++    }
++    else if (IsA(expr, ScalarArrayOpExpr))
++    {
++        const ScalarArrayOpExpr *e = (const ScalarArrayOpExpr *) expr;
++        char	   *opname;
++        opname = get_opname(e->opno);
++        fprint_expr(fp, linitial(e->args), rtable);
++        fprintf(fp," %s ", ((opname != NULL) ? opname : "(invalid operator)"));
++        if(e->useOr){
++            fprintf(fp, "ANY ");
++        }
++        else{
++            fprintf(fp, "ALL ");
++        }
++        fprint_expr(fp, lsecond(e->args), rtable);
++    }
++    else if (IsA(expr, BoolExpr))
++    {
++        const BoolExpr *e = (const BoolExpr *) expr;
++        ListCell   *l;
++
++        if (e->boolop == NOT_EXPR)
++        {
++            fprintf(fp, "NOT (");
++            fprint_expr(fp, linitial(e->args), rtable);
++            fprintf(fp, ")");
++        }
++        else
++        {
++            char *op_name;
++            if (e->boolop == AND_EXPR)
++            {
++                op_name = " AND ";
++            }
++            else
++            {
++                op_name = " OR ";
++            }
++            foreach(l, e->args)
++            {
++                fprintf(fp, "(");
++                fprint_expr(fp, lfirst(l), rtable);
++                fprintf(fp, ")");
++                if (lnext(e->args, l))
++                    fprintf(fp, op_name);
++            }
++        }
++    }
++    else if (IsA(expr, RelabelType))
++    {
++        const RelabelType *e = (const RelabelType *) expr;
++        fprint_expr(fp, e->arg, rtable);
++    }
++    else if (IsA(expr, CaseExpr))
++    {
++        ListCell   *l;
++        const CaseExpr *e = (const CaseExpr *) expr;
++        fprintf(fp,"CASE ");
++        foreach(l, e->args)
++        {
++            fprint_expr(fp, lfirst(l), rtable);
++            fprintf(fp," ");
++        }
++        fprintf(fp,"ELSE ");
++        fprint_expr(fp, e->defresult, rtable);
++        fprintf(fp," END");
++    }
++    else if (IsA(expr, CaseWhen))
++    {
++        const CaseWhen *e = (const CaseWhen *) expr;
++        fprintf(fp,"WHEN ");
++        fprint_expr(fp, e->expr, rtable);
++        fprintf(fp,"THEN ");
++        fprint_expr(fp, e->result, rtable);
++    }
++    else if (IsA(expr, Param))
++    {
++        fprintf(fp,"unsupported expr: Param");
++    }
++    else if (IsA(expr, SubPlan))
++    {
++        fprintf(fp,"unsupported expr: SubPlan");
++    }
++    else if (IsA(expr, AlternativeSubPlan))
++    {
++        fprintf(fp,"unsupported expr: AlternativeSubPlan");
++    }
++    else if (IsA(expr, CoerceViaIO))
++    {
++        fprintf(fp,"unsupported expr: CoerceViaIO");
++    }
++    else if (IsA(expr, CoerceToDomain))
++    {
++        fprintf(fp,"unsupported expr: CoerceToDomain");
++    }
++    else if (IsA(expr, CoerceToDomainValue))
++    {
++        fprintf(fp,"unsupported expr: CoerceToDomainValue");
++    }
++    else
++    {
++        fprintf(fp, "unknown expr %d", expr->type);
++    }
++}
++
++
++static void
++print_basic_rel(FILE* fp, PlannerInfo *root, RelOptInfo *rel, double nrows){
++    int relid;
++
++    if (nrows < 0){
++        nrows = rel->rows;
++    }
++    fprintf(fp, "{\"id\": %d,\n", rel->query_no);
++
++    relid =  bms_next_member(rel->relids, -1);
++    //fprintf(fp, "\"relid\": %d,\n", root->simple_rte_array[relid]->relid);
++    fprintf(fp, "\"table\": \"%s\",\n", get_rel_name(root->simple_rte_array[relid]->relid));
++
++    fprintf(fp, "\"table_alias\": ");
++    print_relids(fp, root, rel->relids);
++    fprintf(fp, ",\n");
++
++    fprintf(fp, "\"rows\": %.0f,\n", nrows);
++
++    fprintf(fp, "\"width\": %d,\n", rel->reltarget->width);
++
++    fprintf(fp, "\"predicates\": [");
++    if (rel->baserestrictinfo)
++    {
++        print_restrictclauses(fp, root, rel->baserestrictinfo);
++    }
++    fprintf(fp, "]}\n");
++    fprintf(fp, ",\n");
++
++}
++
++static void
++print_child_rel(FILE* fp, RelOptInfo *rel, double nrows){
++    if (nrows < 0){
++        nrows = rel->rows;
++    }
++
++    fprintf(fp, "{\"id\": %d, ", rel->query_no);
++    fprintf(fp, "\"rows\": %.0f}", nrows);
++}
++
++static void
++print_single_rel(PlannerInfo *root, RelOptInfo *rel) {
++    FILE* f_rec= fopen("single_table_subplan_order.txt", "a+");
++
++    rel->query_no = query_no++;
++    print_basic_rel(f_rec, root, rel, -1);
++    fclose(f_rec);
++}
++
++
++
++static void
++print_join_rel(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outer_rel, RelOptInfo *inner_rel, JoinType jointype, List *restrictlist, double nrows, double outer_rows, double inner_rows){
++    FILE* f_rec= fopen("multi_table_subplan_order.txt", "a+");
++
++    const char *jointype_string;
++    switch (jointype)
++    {
++        case JOIN_INNER:
++            jointype_string = "Inner";
++            break;
++        case JOIN_LEFT:
++            jointype_string = "Left";
++            break;
++        case JOIN_FULL:
++            jointype_string = "Full";
++            break;
++        case JOIN_RIGHT:
++            jointype_string = "Right";
++            break;
++        case JOIN_SEMI:
++            jointype_string = "Semi";
++            break;
++        case JOIN_ANTI:
++            jointype_string = "Anti";
++            break;
++        default:
++            jointype_string = "???";
++            break;
++    }
++
++    joinrel->query_no = query_no;
++    fprintf(f_rec, "{\"id\": %d,\n", query_no++);
++
++    fprintf(f_rec, "\"join_type\": \"%s\",\n", jointype_string);
++
++    fprintf(f_rec, "\"join_clauses\": [");
++    print_restrictclauses(f_rec, root, restrictlist);
++    fprintf(f_rec, "],\n");
++
++
++    fprintf(f_rec, "\"table_aliases\": [");
++    print_relids(f_rec, root, joinrel->relids);
++    fprintf(f_rec, "],\n");
++
++    fprintf(f_rec, "\"rows\": %.0f,\n", nrows);
++    fprintf(f_rec, "\"width\": %d,\n", joinrel->reltarget->width);
++
++    fprintf(f_rec, "\"children\": [");
++    print_child_rel(f_rec, outer_rel, outer_rows);
++    fprintf(f_rec, ", ");
++    print_child_rel(f_rec, inner_rel, inner_rows);
++    fprintf(f_rec, "]}\n");
++    fprintf(f_rec, ",\n");
++
++    fclose(f_rec);
++}
++
++static void
++print_query_no(const char* func_name)
++{
++    FILE *file = fopen("costsize.log", "a+");
++
++    time_t rawtime;
++    struct tm * timeinfo;
++    char time_buffer [128];
++
++    time (&rawtime);
++    timeinfo = localtime (&rawtime);
++    strftime (time_buffer,sizeof(time_buffer),"%Y/%m/%d %H:%M:%S",timeinfo);
++
++    fprintf(file, "%s: pid[%d] in [%s]: query num: %d\n", time_buffer, getpid(), func_name, query_no);
++    fclose(file);
++}
++
++static void
++print_est_card(const char* func_name, double card_est)
++{
++    FILE *file = fopen("costsize.log", "a+");
++
++    time_t rawtime;
++    struct tm * timeinfo;
++    char time_buffer [128];
++
++    time (&rawtime);
++    timeinfo = localtime (&rawtime);
++    strftime (time_buffer,sizeof(time_buffer),"%Y/%m/%d %H:%M:%S",timeinfo);
++
++    fprintf(file, "%s: pid[%d] in [%s]: %0.9f\n", time_buffer, getpid(), func_name, card_est);
++    fclose(file);
++}
++
++static void
++read_from_fspn_estimate(const char* filename)
++{
++    FILE* fp = fopen(filename, "r");
++    double card_est;
++    int query_cnt = 0;
++
++    while (fscanf(fp, "%lf", &card_est) == 1){
++        card_ests[query_cnt] = card_est;
++        query_cnt += 1;
++    }
++
++    fclose(fp);
++}
++
++static void
++read_from_fspn_join_estimate(const char* filename){
++//    FILE* fp = fopen("fspn_job_light_join_est_fkfk_with_psql.txt", "r");
++    FILE* fp = fopen(filename, "r");
++
++    double card_est;
++    int cnt = 0;
++
++    while (fscanf(fp, "%lf", &card_est) == 1){
++        join_card_ests[cnt] = card_est;
++        cnt += 1;
++    }
++
++    fclose(fp);
++}
++
++int
++StringCompare( const void* a, const void* b)
++{
++    char const **char_a = a;
++    char const **char_b = b;
++
++    return strcmp(*char_a, *char_b);
++}
++
++// <<<<< END2END
+ 
+ /*
+  * clamp_row_est
+@@ -562,6 +1133,12 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
+ 				   &indexSelectivity, &indexCorrelation,
+ 				   &index_pages);
+ 
++// END2END >>>>>
++//    if (ml_cardest_enabled) {
++//        print_est_card(__FUNCTION__, indexSelectivity);
++//    }
++// <<<<< END2END
++
+ 	/*
+ 	 * Save amcostestimate's results for possible use in bitmap scan planning.
+ 	 * We don't bother to save indexStartupCost or indexCorrelation, because a
+@@ -4939,8 +5516,37 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+ 							   JOIN_INNER,
+ 							   NULL);
+ 
++// END2END >>>>>
++    if(ml_cardest_enabled) {
++//        print_query_no(__FUNCTION__);
++        if (query_no == 0) {
++            read_from_fspn_estimate(ml_cardest_fname);
++        }
++
++        double new_nrows = card_ests[query_no];
++
++        if (debug_card_est) {
++            FILE *ffp = fopen("old_new_single_est.txt", "w");
++            fprintf(ffp, "%.5f:%.5f\n", nrows, new_nrows);
++            fclose(ffp);
++        }
++
++        if (new_nrows >= 0){
++            nrows = new_nrows;
++        }
++//        print_est_card(__FUNCTION__, rel->rows);
++        query_no++;
++    }
++// <<<<< END2END
++
+ 	rel->rows = clamp_row_est(nrows);
+ 
++// END2END >>>>>
++    if (print_single_tbl_queries) {
++        print_single_rel(root, rel);
++    }
++// <<<<< END2END
++
+ 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
+ 
+ 	set_rel_width(root, rel);
+@@ -5018,6 +5624,11 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+ 										   inner_rel->rows,
+ 										   sjinfo,
+ 										   restrictlist);
++
++// END2END >>>>>
++//    debug_print_rel(root, rel);
++//    print_est_card(__FUNCTION__, rel->rows);
++// <<<<< END2END
+ }
+ 
+ /*
+@@ -5061,6 +5672,11 @@ get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
+ 									   inner_path->rows,
+ 									   sjinfo,
+ 									   restrict_clauses);
++
++// END2END >>>>>
++//    print_est_card(__FUNCTION__, nrows);
++// <<<<< END2END
++
+ 	/* For safety, make sure result is not more than the base estimate */
+ 	if (nrows > rel->rows)
+ 		nrows = rel->rows;
+@@ -5093,6 +5709,11 @@ calc_joinrel_size_estimate(PlannerInfo *root,
+ 	Selectivity jselec;
+ 	Selectivity pselec;
+ 	double		nrows;
++    List *full_restrict;
++
++    if (print_sub_queries) {
++        full_restrict = list_copy(restrictlist);
++    }
+ 
+ 	/*
+ 	 * Compute joinclause selectivity.  Note that we are only considering
+@@ -5210,6 +5831,36 @@ calc_joinrel_size_estimate(PlannerInfo *root,
+ 			break;
+ 	}
+ 
++// END2END >>>>>
++
++    /*  print for sub-queries*/
++    if (print_sub_queries){
++        print_join_rel(root, joinrel, outer_rel, inner_rel, jointype, full_restrict, nrows, outer_rows, inner_rows);
++        list_free(full_restrict);
++    }
++
++    if (ml_joinest_enabled) {
++
++        if (join_est_no == 0) {
++            read_from_fspn_join_estimate(ml_joinest_fname);
++        }
++        double join_est = join_card_ests[join_est_no];
++//        printf("Read Join Est from File: %d join_est: %f\n", join_est_no, join_est);
++
++        if (debug_card_est) {
++            FILE *ffp = fopen("old_new_join_est.txt", "a+");
++            fprintf(ffp, "%.5f:%.5f\n", nrows, join_est);
++            fclose(ffp);
++        }
++
++        if (join_est >= 0) {
++            nrows = join_est;
++        }
++
++        join_est_no++;
++    }
++// <<<<< END2END
++
+ 	return clamp_row_est(nrows);
+ }
+ 
+diff --git a/src/backend/optimizer/util/relnode.c b/src/backend/optimizer/util/relnode.c
+index e105a4d..e804065 100644
+--- a/src/backend/optimizer/util/relnode.c
++++ b/src/backend/optimizer/util/relnode.c
+@@ -206,6 +206,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
+ 	Assert(rte != NULL);
+ 
+ 	rel = makeNode(RelOptInfo);
++    rel->query_no = -1;
+ 	rel->reloptkind = parent ? RELOPT_OTHER_MEMBER_REL : RELOPT_BASEREL;
+ 	rel->relids = bms_make_singleton(relid);
+ 	rel->rows = 0;
+@@ -609,6 +610,7 @@ build_join_rel(PlannerInfo *root,
+ 	 * Nope, so make one.
+ 	 */
+ 	joinrel = makeNode(RelOptInfo);
++    joinrel->query_no = -1;
+ 	joinrel->reloptkind = RELOPT_JOINREL;
+ 	joinrel->relids = bms_copy(joinrelids);
+ 	joinrel->rows = 0;
+@@ -787,6 +789,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
+ 					 JoinType jointype)
+ {
+ 	RelOptInfo *joinrel = makeNode(RelOptInfo);
++    joinrel->query_no = -1;
+ 	AppendRelInfo **appinfos;
+ 	int			nappinfos;
+ 
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index ad35340..649232d 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -580,6 +580,11 @@ HANDLE		PostmasterHandle;
+ void
+ PostmasterMain(int argc, char *argv[])
+ {
++
++// END2END >>>>>
++    ereport(LOG, (errmsg_internal("%s:", "Benchmark Start..."), errdetail_internal("%s", "Postgres Main")));
++// <<<<< END2END
++
+ 	int			opt;
+ 	int			status;
+ 	char	   *userDoption = NULL;
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index ef62bb8..26949b0 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -2123,6 +2123,58 @@ static struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++// END2END >>>>>
++    {
++        {"ml_cardest_enabled", PGC_USERSET, UNGROUPED,
++            gettext_noop("Enable ML-based Cardinality Estimation."),
++            NULL
++        },
++        &ml_cardest_enabled,
++        false,
++        NULL, NULL, NULL
++    },
++
++    {
++        {"ml_joinest_enabled", PGC_USERSET, UNGROUPED,
++            gettext_noop("Enable ML-based Cardinality Estimation."),
++            NULL
++        },
++        &ml_joinest_enabled,
++        false,
++        NULL, NULL, NULL
++    },
++
++    {
++        {"debug_card_est", PGC_USERSET, UNGROUPED,
++            gettext_noop("Enable cardinality estimation debug."),
++            NULL
++        },
++        &debug_card_est,
++        false,
++        NULL, NULL, NULL
++    },
++
++    {
++        {"print_single_tbl_queries", PGC_USERSET, UNGROUPED,
++            gettext_noop("Enable single-table queries printing."),
++            NULL
++        },
++        &print_single_tbl_queries,
++        false,
++        NULL, NULL, NULL
++    },
++
++    {
++        {"print_sub_queries", PGC_USERSET, UNGROUPED,
++            gettext_noop("Enable sub-queries printing."),
++            NULL
++        },
++        &print_sub_queries,
++        false,
++        NULL, NULL, NULL
++    },
++// <<<<< END2END
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
+@@ -3553,6 +3605,28 @@ static struct config_int ConfigureNamesInt[] =
+ 		check_client_connection_check_interval, NULL, NULL
+ 	},
+ 
++// END2END >>>>>
++    {
++        {"query_no", PGC_USERSET, UNGROUPED,
++            gettext_noop("Sets the query number of cardinality estimation."),
++            NULL
++        },
++        &query_no,
++        0, 0, INT_MAX,
++        NULL, NULL, NULL
++    },
++
++    {
++        {"join_est_no", PGC_USERSET, UNGROUPED,
++            gettext_noop("Sets the query number of cardinality estimation."),
++            NULL
++        },
++        &join_est_no,
++        0, 0, INT_MAX,
++        NULL, NULL, NULL
++    },
++// <<<<< END2END
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
+@@ -4601,6 +4675,30 @@ static struct config_string ConfigureNamesString[] =
+ 		check_backtrace_functions, assign_backtrace_functions, NULL
+ 	},
+ 
++// END2END >>>>>
++    {
++        {"ml_cardest_fname", PGC_USERSET, UNGROUPED,
++            gettext_noop("Sets the file name of ML-based cardnality estimation."),
++            NULL,
++            GUC_IS_NAME
++        },
++        &ml_cardest_fname,
++        "",
++        check_cluster_name, NULL, NULL
++    },
++
++    {
++        {"ml_joinest_fname", PGC_USERSET, UNGROUPED,
++            gettext_noop("Sets the file name of ML-based join size estimation."),
++            NULL,
++            GUC_IS_NAME
++        },
++        &ml_joinest_fname,
++        "",
++        check_cluster_name, NULL, NULL
++    },
++// <<<<< END2END
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL
+diff --git a/src/include/nodes/pathnodes.h b/src/include/nodes/pathnodes.h
+index f16466a..621ec7b 100644
+--- a/src/include/nodes/pathnodes.h
++++ b/src/include/nodes/pathnodes.h
+@@ -770,6 +770,8 @@ typedef struct RelOptInfo
+ 	Relids		all_partrels;	/* Relids set of all partition relids */
+ 	List	  **partexprs;		/* Non-nullable partition key expressions */
+ 	List	  **nullable_partexprs; /* Nullable partition key expressions */
++
++    int query_no;
+ } RelOptInfo;
+ 
+ /*
+diff --git a/src/include/optimizer/cost.h b/src/include/optimizer/cost.h
+index 2113bc8..0d3c2e8 100644
+--- a/src/include/optimizer/cost.h
++++ b/src/include/optimizer/cost.h
+@@ -69,6 +69,20 @@ extern PGDLLIMPORT bool enable_partition_pruning;
+ extern PGDLLIMPORT bool enable_async_append;
+ extern PGDLLIMPORT int constraint_exclusion;
+ 
++// END2END >>>>>
++extern int  query_no;
++extern int  join_est_no;
++extern bool ml_cardest_enabled;
++extern bool ml_joinest_enabled;
++extern bool debug_card_est;
++extern bool print_sub_queries;
++extern bool print_single_tbl_queries;
++extern char *ml_cardest_fname;
++extern char *ml_joinest_fname;
++
++extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
++// <<<<< END2END
++
+ extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
+ 								  double index_pages, PlannerInfo *root);
+ extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
