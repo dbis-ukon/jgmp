@@ -3,7 +3,9 @@
 
 ### Setup
 
-Simply build the docker image and run it:
+Download the database backups and schemas (https://cloud.uni-konstanz.de/index.php/s/q38YzXZQLmBebsF) and add them to the directory data/backups.
+
+Then, build the docker image and run it:
 ```bash
 $ sudo docker build -t jgmp_img .
 $ sudo docker run --name jgmp -d jgmp_img
